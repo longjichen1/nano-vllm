@@ -10,6 +10,7 @@ from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
+from nanovllm.layers.attention import flash_attn_supported
 
 
 class ModelRunner:
@@ -18,7 +19,7 @@ class ModelRunner:
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
-        self.enforce_eager = config.enforce_eager
+        self.enforce_eager = config.enforce_eager or not flash_attn_supported()
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
