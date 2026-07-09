@@ -16,29 +16,60 @@ from nanovllm.layers.attention import flash_attn_supported
 class ModelRunner:
 
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
+        # what is self.config?
+        # Claude: the Config dataclass (config.py) — model path, batch/seq limits, etc.
         self.config = config
+        # what is hf_config?
+        # Claude: the HuggingFace AutoConfig for the checkpoint (num layers, num heads,
+        # hidden size, dtype) — set in Config.__post_init__.
         hf_config = config.hf_config
+        # TODO I'm also not sure what this block size is. Is this the context window size?
+        # Claude: not the context window (that's max_model_len). This is the KV-cache
+        # paging block size (256 tokens) — same block_size from Phase 3's BlockManager.
         self.block_size = config.kvcache_block_size
+        # TODO what is eager mode?
+        # Claude: general PyTorch term — ops run immediately one at a time, vs. a
+        # captured/compiled graph (here: CUDA graphs) with fixed shapes and less overhead.
         self.enforce_eager = config.enforce_eager or not flash_attn_supported()
+        # TODO is this the size of the tensor on the GPU? or is it the size of the context window?
+        # Claude: neither — it's tensor_parallel_size, the number of processes sharding
+        # the model. Full mechanics are Phase 7; don't conflate with KV-cache sizing.
         self.world_size = config.tensor_parallel_size
+        # TODO not sure what this is
         self.rank = rank
+        # TODO not sure what event is either
         self.event = event
 
+        # TODO is this worth exploring? I'm seeing nccl which i think is some kind of distributed inference
+        # Claude: correct guess — NVIDIA's collective-communication library, used for
+        # multi-GPU all-reduce etc. Deep usage is Phase 7 (linear.py); nothing to chase yet.
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        # okay this looks like rank is the device? the cuda is setting it
+        # Claude: confirmed — rank = process id = GPU device index.
         torch.cuda.set_device(rank)
+        # TODO what is the default_dtype? do i even need to know it
+        # Claude: torch.set_default_dtype/device below mutate global process state, so
+        # this just saves the prior value to restore at the end. Not important beyond that.
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
+        # This loads the model
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
+        
+        # TODO go back to this, not sure what the sampler is. Will come back after seeing how it's used in this model runner, but for now I assume it handles applying the samplilng params (temp, max tokens, ignore_eos)
+        # Claude: your hypothesis is correct, confirmed. Deep internals are Phase 6.
         self.sampler = Sampler()
+        # TODO what does this do?
         self.warmup_model()
+        # TODO, i understand this conceptually, but not really deeply
         self.allocate_kv_cache()
         if not self.enforce_eager:
             self.capture_cudagraph()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
+        # TODO is world size the number of GPUs? okay it does look like the number of individual processes. however, it is usually equal to the total number of gpus...?
         if self.world_size > 1:
             if rank == 0:
                 self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
@@ -48,25 +79,41 @@ class ModelRunner:
                 self.shm = SharedMemory(name="nanovllm")
                 self.loop()
 
+    # this looks pretty self explanatory, though i wonder what shm is (ah i see, its shared memory, as defined in L60/64)
     def exit(self):
         if self.world_size > 1:
             self.shm.close()
+            # what is dist.barrier()?
+            # Claude: blocks every process in the group until ALL have called it — here,
+            # ensures no rank unlinks the shared-memory segment while another rank might
+            # still be reading it.
             dist.barrier()
             if self.rank == 0:
                 self.shm.unlink()
         if not self.enforce_eager:
             del self.graphs, self.graph_pool
+        # what is torch.cuda.synchronize? is it worth looking up what it does -> ah okay, its like a wait all for all async tasks (kernels)
         torch.cuda.synchronize()
         dist.destroy_process_group()
 
+    # keeps the inf eng going until we exit. 
+    # TODO What's the condition that we exit? or that exit is called? let's figure this out
     def loop(self):
         while True:
             method_name, args = self.read_shm()
             self.call(method_name, *args)
             if method_name == "exit":
                 break
-
+    
+    # looks pretty self explanatory on the surface, just reads the shared memory (i assume this handles the "read api")
     def read_shm(self):
+        # looks like this function is explicitly for multiple GPUs? i need to go back and validate what world size is
+        # i dont think so actually, loop always calls self.read_shm. World size is something else. Actually it looks like it is. however, wouldn't this assert always be false?
+        # Claude: opposite — always TRUE. loop() (the only caller of read_shm) is only
+        # ever invoked from the `else` branch of `if rank == 0:` inside __init__'s
+        # `if self.world_size > 1:` block, so by the time read_shm runs, world_size>1
+        # and rank>0 already hold by construction. It's a defensive invariant check,
+        # not a bug — good catch stopping to question it though.
         assert self.world_size > 1 and self.rank > 0
         self.event.wait()
         n = int.from_bytes(self.shm.buf[0:4], "little")
@@ -74,6 +121,7 @@ class ModelRunner:
         self.event.clear()
         return method_name, args
 
+    # looks pretty self explanatory on the surface, just writes to the shared memory (i assume this handles the "write api")
     def write_shm(self, method_name, *args):
         assert self.world_size > 1 and self.rank == 0
         data = pickle.dumps([method_name, *args])

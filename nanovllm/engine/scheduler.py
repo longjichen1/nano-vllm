@@ -27,18 +27,27 @@ class Scheduler:
         num_batched_tokens = 0
 
         # prefill
+        # while the scheduler is self.waiting, it is doing prefill. and if we have max_num_seqs left to process
+        # the main function of this loop is to load the scheduled_seqs
         while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.waiting[0]
             remaining = self.max_num_batched_tokens - num_batched_tokens
+            # if no more remaining tokens to prefill
             if remaining == 0:
                 break
+            # TODO not sure what seq.block_table is - Ah, block table is the list of block indices. So, if we haven't previously
+            # allocated any blocks
             if not seq.block_table:
-                num_cached_blocks = self.block_manager.can_allocate(seq)
+                # how many blocks can we allocate? if we cannot allocate anything, this loop is done
+                num_cached_blocks = self.block_manager.can_allocate(seq) # also checks how many blocks we have cached already (reusing prefixes)
                 if num_cached_blocks == -1:
                     break
-                num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
+                num_tokens = seq.num_tokens - num_cached_blocks * self.block_size # tokens left (after cached)
             else:
+                # this is not our first time allocating, so we dont need to allocate, just need to have the remaining tokens
                 num_tokens = seq.num_tokens - seq.num_cached_tokens
+
+            # if we have remaining tokens left in this prefill, and we have sequences left in this batch. This is usually both true
             if remaining < num_tokens and scheduled_seqs:  # only allow chunked prefill for the first seq
                 break
             if not seq.block_table:
