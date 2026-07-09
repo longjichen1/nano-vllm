@@ -89,6 +89,11 @@ class Scheduler:
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
         for seq, token_id in zip(seqs, token_ids):
+            # not sure what this part does exactly, but everything afterwards just handles appending the token
+            # to prefill or decode. if its prefill and we haven't cached every token, we skip this sequence in
+            # post process. If it is done, we append the last token to the sequence. If it is decode, we keep appending
+            # however, if the decode reaches EOS or max_tokens (depending on seq.ignore_eos), we mark the sequence
+            # as finished, deallocate the kv cache blocks, and remove the sequence from the schedule
             self.block_manager.hash_blocks(seq)
             seq.num_cached_tokens += seq.num_scheduled_tokens
             seq.num_scheduled_tokens = 0

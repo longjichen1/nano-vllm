@@ -26,14 +26,24 @@ reopened in reading-list-plus-questions format, in that order, since block_manag
 on block_manager. Old log entries under 1–3 are Claude's reference notes only
 — not verified understanding, don't rely on them.
 
+**2026-07-09 update:** Phase 1 fully walked and checkpointed. Phase 2 mostly
+covered — a lot of it happened as live back-and-forth conversation rather than
+written-in-file answers, so Claude backfilled blockquote notes under each
+question summarizing what was established, and checked off what's actually
+verified vs. what's still open. Time estimates added per phase below —
+forward-looking pacing estimates only, not a record of actual time spent.
+Rough remaining total from here (Phase 2 tail → Phase 9): **~5–7 hours**,
+front-loaded toward Phase 4 (CUDA graphs + memory arithmetic is the densest
+remaining section) and Phase 6 (model internals).
+
 ---
 
-## Phase 0 — Setup & orientation
+## Phase 0 — Setup & orientation *(Est. 30 min — DONE)*
 - [x] Get nano-vllm running end to end on Turing (RTX 2070 SUPER) via SDPA fallback
 - [x] Understand why FlashAttention-2 doesn't work on sm75, and what the patch does
 - [x] Read HANDOVER.md, confirm environment/run commands
 
-## Phase 1 — `sampling_params.py` + `sequence.py`  *(REOPENED — ACTIVE, your turn to read)*
+## Phase 1 — `sampling_params.py` + `sequence.py`  *(Est. 45–60 min — DONE, checkpoint walked 2026-07-09)*
 
 **Read:** `sampling_params.py` (8 lines) and `engine/sequence.py` (~85 lines) in full.
 Skip `llm_engine.py` for now — you'll want it fresh again after Phase 2 (scheduler) since
@@ -258,7 +268,7 @@ with prefill once `num_cached_tokens + num_scheduled_tokens == num_tokens`.
 ### Checkpoint
 Walk Claude through 1.1–1.5 before moving to Phase 2.
 
-## Phase 2 — `engine/scheduler.py`  *(REOPENED — pending Phase 1 checkpoint)*
+## Phase 2 — `engine/scheduler.py`  *(Est. 60–90 min — IN PROGRESS, ~80% covered as of 2026-07-09)*
 
 **Read:** `engine/scheduler.py` in full (~93 lines).
 
@@ -273,59 +283,130 @@ seq (LIFO via `self.running.pop()`), not the seq that actually needs the block.
 </details>
 
 ### 2.1 `schedule()` — prefill loop
-- [ ] Walk the `while self.waiting and len(scheduled_seqs) < self.max_num_seqs:` loop
+- [x] Walk the `while self.waiting and len(scheduled_seqs) < self.max_num_seqs:` loop
       line by line. What does `remaining` track, and what causes the loop to `break`
       entirely vs. just stop adding *this* seq?
       **User** - The remaining tracks the budget left in this batch. the loop breaks entirely when 
       there are no more budget for tokens left, or if there are no more kv blocks left to allocate
       we stop adding this prefix when we have scheduled all of the tokens left in this sequence
-- [ ] `if not seq.block_table:` branches into calling `block_manager.can_allocate` —
+      > **🤖 Claude:** both `break` conditions (budget exhausted, `can_allocate` returns
+      > -1) are exactly right. One refinement: there's actually no code path where the loop
+      > "just stops adding this seq but keeps going with others" within the same call —
+      > every exit from this loop is a full `break`. Proved this later in conversation:
+      > whenever the chunked-prefill branch fires (`remaining < num_tokens and
+      > scheduled_seqs`), `num_scheduled_tokens = min(num_tokens, remaining)` always equals
+      > `remaining` exactly, draining the budget to 0 and forcing the very next iteration to
+      > `break` at the top anyway. So "fully schedule this seq and continue" or "break
+      > entirely" are the only two outcomes per call — never a partial skip.
+- [x] `if not seq.block_table:` branches into calling `block_manager.can_allocate` —
       what does an empty `block_table` mean about this seq's state (new arrival vs.
       continuing a chunked prefill)?
       **User** - empty block table means that this is the first time this sequence is going through a batch. and no blocks has been allocated for this sequence yet
       non empty block_table means that we already allocated the blocks for this sequence, and it is chunked prefill
       (this means that we have previously already ran a prefill run on this )
-- [ ] The comment-equivalent logic `if remaining < num_tokens and scheduled_seqs: break`
+      > **🤖 Claude:** correct on both. Confirmed later too: `allocate()` always reserves
+      > blocks for the *entire* prompt in one shot (based on `seq.num_blocks`, computed
+      > from the full `num_tokens` set at `Sequence.__init__`) — not incrementally per
+      > chunk — so a non-empty `block_table` really does mean "already fully allocated,
+      > just resuming token-by-token processing," never "partially allocated."
+- [x] The comment-equivalent logic `if remaining < num_tokens and scheduled_seqs: break`
       — explain in your own words what "only allow chunked prefill for the first seq"
       means and why the check is specifically `and scheduled_seqs` (i.e. only applies if
-      something's already been scheduled this call).xxxxxxxxxdffdsfxxfadfadfasdfasdfasdfaadfadsffdasdf
-- [ ] `if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:` — what
+      something's already been scheduled this call).
+      > **🤖 Claude — covered live in conversation, 2026-07-09:** `scheduled_seqs` is empty
+      > only for the very first candidate examined in a call — that's the one exemption
+      > that lets a sequence whose `num_tokens` alone exceeds the entire budget still get
+      > admitted (chunked), specifically to guarantee liveness (without it, a too-big
+      > prompt would `break` every single call, forever, deadlocking the engine). Once ≥1
+      > seq is already scheduled this call, that liveness guarantee is already satisfied,
+      > so a 2nd/3rd candidate that doesn't fit just gets `break`'d entirely and retried
+      > next call with a fresh full budget — chunking it too would only fragment the step
+      > for no completion benefit. Also found: nano-vllm's "only first seq chunks" is a
+      > simplification vs. real vLLM (which packs partial chunks from multiple seqs to
+      > avoid wasting leftover budget) — traced a concrete example (950 + 1050 token seqs,
+      > budget 1000) where full chunking finishes in 2 steps vs. nano-vllm's 3, confirming
+      > it does cost some throughput for scheduler simplicity.
+- [x] `if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:` — what
       real-world condition does this detect, and what two things happen to the seq when
       it's true?
+      > **🤖 Claude — covered live in conversation, 2026-07-09:** detects "this step's work
+      > brings the sequence's cached-token count all the way up to its full prompt length"
+      > — i.e. prefill just finished (including finishing exactly via a chunk this step).
+      > The two things: `seq.status = SequenceStatus.RUNNING`, and it moves from
+      > `self.waiting` to `self.running` (`popleft()` + `append()`). Runs regardless of
+      > whether this step chunked or fully processed the seq — purely about the
+      > *cumulative* cached-token total.
 
 ### 2.2 `schedule()` — decode loop
 - [ ] Why does the decode loop only run `if scheduled_seqs` is empty from the prefill
       loop above (look at the `if scheduled_seqs: return ...` right before it)? What does
       that imply about whether prefill and decode ever happen in the same `schedule()`
       call?
-- [ ] Walk the `while not self.block_manager.can_append(seq):` inner loop and the
+- [x] Walk the `while not self.block_manager.can_append(seq):` inner loop and the
       `for...else` construct. What is `self.preempt(self.running.pop())` actually evicting,
       and why pop from the *end* of `running` rather than the *front*? What happens in the
       degenerate case where `seq` itself is the only running sequence and still can't get a
       block?
+      > **🤖 Claude — covered live in conversation, 2026-07-09:** `self.running.pop()` (right
+      > end) evicts the most-recently-scheduled running sequence first — LIFO, sacrificing
+      > younger sequences before ones with more invested work. Each preemption evicts the
+      > victim's *entire* `block_table` (`deallocate()` has no partial mode) — the "just
+      > enough" behavior comes from the `while` re-checking `can_append` after each full
+      > eviction, not from evicting partial amounts. Degenerate case: when `self.running`
+      > is empty (nobody left to sacrifice), it preempts `seq` itself and `break`s out of
+      > the inner loop (skipping the `else`), so `seq` doesn't get scheduled this step
+      > either — sent back to `waiting` like any other victim.
 
 ### 2.3 `preempt`
-- [ ] Three things happen in `preempt`. What state does a preempted sequence lose, and
+- [x] Three things happen in `preempt`. What state does a preempted sequence lose, and
       where does it go (front or back of `waiting`)? Why is losing its blocks safe/correct
       given what you know about `hash_to_block_id` from block_manager (even without having
       read block_manager in depth yet — just reason about whether recomputation vs.
       correctness is at stake)?
+      **User** - i think losing its blocks is safe/correct because we only erase the blocks
+      allocated to this sequence → refined to: `deallocate()` only touches
+      `seq.block_table`/`seq.num_cached_tokens`, never `seq.token_ids`, so we just lose
+      time (redo prefill), not correctness, since a forward pass is deterministic given the
+      same tokens.
+      > **🤖 Claude:** exactly right, confirmed 2026-07-09. Also nailed the follow-up: it
+      > goes to the *front* of `waiting` (`appendleft`), and freed blocks aren't wiped —
+      > `_deallocate_block` doesn't clear `block.hash`/`block.token_ids`, so a freed block
+      > is still findable via `hash_to_block_id` until some other `allocate()` call claims
+      > that exact `block_id`. Rescheduling the victim ASAP (front of queue) minimizes that
+      > window, giving it a real shot at a partial/full prefix-cache hit on its own prior
+      > work rather than a guaranteed full recompute.
 
 ### 2.4 `postprocess()`
 - [ ] Order of operations matters here: `hash_blocks` is called *before*
       `seq.num_cached_tokens += seq.num_scheduled_tokens`. Why does the hashing need to
       happen first — what would be wrong about the block boundaries if you incremented
       `num_cached_tokens` first?
-- [ ] `if is_prefill and seq.num_cached_tokens < seq.num_tokens: continue` — what real
+- [x] `if is_prefill and seq.num_cached_tokens < seq.num_tokens: continue` — what real
       scenario does this `continue` skip past (i.e., don't append a sampled token yet)?
+      **User** (from inline scheduler.py comment) — "if its prefill and we haven't cached
+      every token, we skip this sequence in postprocess."
+      > **🤖 Claude:** correct — this skips appending a token when a chunked-prefill step
+      > didn't finish the whole prompt yet; there's no "next token" to sample/append until
+      > prefill is actually complete.
 - [ ] The finish condition checks `seq.num_completion_tokens == seq.max_tokens` — go
       back to `sequence.py`'s `num_completion_tokens` property and confirm you know
       exactly which tokens that counts.
 
 ### Checkpoint
-Walk Claude through 2.1–2.4 before returning to Phase 3.
+2.1 (all 4), 2.2's second bullet, and 2.3 are walked and verified (2026-07-09).
+Remaining before Phase 2 is fully closed: 2.2's first bullet, and 2.4's first and
+third bullets.
 
-## Phase 3 — BlockManager: paged KV cache + prefix caching  *(REOPENED — pending Phase 1 & 2 checkpoints)*
+## Phase 3 — BlockManager: paged KV cache + prefix caching  *(Est. 30–45 min remaining)*
+
+**2026-07-09 note:** a surprising amount of this phase already happened as a side
+effect of Phase 2 conversation — `can_allocate`/`allocate` mechanics, `ref_count`
+sharing across sequences (cache-hit blocks vs. private decode-time blocks),
+`_allocate_block`/`_deallocate_block` and the `free_block_ids` FIFO ordering,
+`hash_blocks` timing/purpose, and `can_append`'s block-boundary check were all
+covered in depth already. What's left is mostly formalizing it against 3.1–3.6's
+specific questions below (some will go fast) and actually running the demo script
+yourself (3.6) — probably closer to 30 min than the original 60–90 estimate.
 
 **Read:** `engine/block_manager.py` in full (~120 lines). Have `engine/sequence.py`
 and `engine/scheduler.py` open alongside since block_manager is called from there.
@@ -403,7 +484,7 @@ trailing partial block). Demo script (still usable, run it yourself now):
 ### Checkpoint
 Walk Claude through your answers to 3.1–3.6 before we resume Phase 4.
 
-## Phase 4 — GPU bridge: `model_runner.py`  *(PAUSED — resume after Phase 1, 2 & 3 checkpoints)*
+## Phase 4 — GPU bridge: `model_runner.py`  *(Est. 90–120 min — PAUSED, resume after Phase 1, 2 & 3 checkpoints)*
 
 You've already made a first pass at `__init__`/`exit`/`loop`/`read_shm` via inline
 `# Claude:` comments in the file — that stands, no need to redo it. 4.1–4.5 (the
@@ -479,14 +560,14 @@ When you've worked through 4.1–4.5, tell Claude your answers (or paste your
 notes) and we'll verify together, then check off the boxes and log findings
 below.
 
-## Phase 5 — KV-cache write path
+## Phase 5 — KV-cache write path *(Est. 45–60 min)*
 - [ ] `store_kvcache` triton kernel — how `slot_mapping` addresses the paged cache
 - [ ] Connect back to `layers/attention.py`: the three modes (causal prefill, prefix-cache
       prefill with explicit bottom-right mask, paged decode with block_table gather) —
       already read once during the Turing patch work; revisit with fresh block_manager
       knowledge to see how `block_table` / `slot_mapping` feed the SDPA fallback
 
-## Phase 6 — Model internals: `models/qwen3.py`
+## Phase 6 — Model internals: `models/qwen3.py` *(Est. 60–90 min)*
 - [ ] Overall model graph (embed → transformer blocks → norm → lm_head)
 - [ ] RoPE (`layers/rotary_embedding.py` or wherever it lives)
 - [ ] GQA (grouped-query attention) — how num_kv_heads < num_heads is handled
@@ -497,18 +578,18 @@ below.
       as already partially understood from Phase 1 read of llm_engine, revisit in depth)
 - [ ] `utils/loader.py` — weight loading/mapping from HF checkpoint
 
-## Phase 7 — Tensor parallelism
+## Phase 7 — Tensor parallelism *(Est. 30–45 min — conceptual only, single-GPU box)*
 - [ ] `layers/linear.py` — column/row-parallel linear layers, all-reduce points
 - [ ] How `tensor_parallel_size > 1` spawns processes in `llm_engine.py` (`mp.spawn`, events)
       and how `Sequence.__getstate__`/`__setstate__` fit in (cross-process seq state)
 
-## Phase 8 — Turing patch deep dive (revisit with full context)
+## Phase 8 — Turing patch deep dive (revisit with full context) *(Est. 30 min)*
 - [x] High-level: `flash_attn_supported()`, SDPA fallback reproducing 3 attention modes
 - [ ] Line-by-line reread of the SDPA fallback now that block_manager/model_runner are
       understood — check the explicit bottom-right mask construction for prefix-cache
       prefill, and the K/V gather-from-block_table for decode
 
-## Phase 9 — Stretch goals (optional)
+## Phase 9 — Stretch goals (optional) *(Est. open-ended)*
 - [ ] Benchmark: measure actual prefill/decode speedup from prefix caching (time prompt B
       with vs. without a shared-prefix warm cache)
 - [ ] Try `kvcache_block_size` other than 256 (needs multiple-of-256 assert — inspect why)
