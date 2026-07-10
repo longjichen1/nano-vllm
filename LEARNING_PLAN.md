@@ -428,30 +428,84 @@ trailing partial block). Demo script (still usable, run it yourself now):
 </details>
 
 ### 3.1 `Block` + `compute_hash`
-- [ ] What do the 4 fields of `Block` represent? What does `ref_count` count,
+- [x] What do the 4 fields of `Block` represent? What does `ref_count` count,
       physically — shared across how many what?
-- [ ] `compute_hash(cls, token_ids, prefix=-1)` folds a `prefix` hash into the digest
+      # block_id - the id of this block, pretty self explanatory
+      # ref_count - how many sequences use this block_id
+      # hash - the hash for this block, used mainly in prefix caching so we can look up a block id given a hash of a prefix
+      # token_ids - the token ids in this block
+      > **🤖 Claude:** all 4 correct. `ref_count` precisely: how many *live block_table
+      > entries* (across all currently-allocated sequences) point at this physical
+      > `block_id` — bumped in `allocate()` when a cache-hit block is reused by another
+      > seq, decremented in `deallocate()`, and the block only actually returns to
+      > `free_block_ids` when it hits 0 (that's 3.5's `deallocate` question).
+- [x] `compute_hash(cls, token_ids, prefix=-1)` folds a `prefix` hash into the digest
       before hashing this block's tokens. Why? Concretely: could two *different*
       sequences ever get the same hash for block index 2 if their block-2 token content
       is identical but their block-0/block-1 content differs? Why does that matter for
       correctness of prefix-cache reuse?
+      # not sure what digest is. but i do get why it uses prefix before hasing this blocks tokens. this is because two sequences cannot reuse each other's kv cache if their prefixes differ. this is because the block-2 token content depends on nonlinear relationships learned from block-0/block-1
+      > **🤖 Claude:** quick vocab: "digest" is just the standard term for a hash
+      > function's output (borrowed from crypto — `xxh64().intdigest()` here). Your
+      > conclusion (different prefixes → different hash, even with identical block-2
+      > tokens) is right, but one thing to fix: it's not the **token content** of block 2
+      > that "depends on" block 0/1 — the raw token IDs at block 2 are just whatever text
+      > happens to be there, totally independent of what came before. What actually
+      > depends on block 0/1 is the **KV cache values** (the computed keys/values)
+      > self-attention produces for block 2's tokens — those genuinely differ based on
+      > full prior context, even if the token IDs are byte-identical. So here's the real
+      > stakes: without folding `prefix` into the hash, two sequences with identical
+      > block-2 token IDs but different block-0/1 content would hash to the *same* value
+      > for block 2 — a false collision. `can_allocate` would then think "cache hit,"
+      > and sequence B would get pointed at sequence A's physical block, whose stored KV
+      > tensors were computed over A's (different) preceding context. The model's forward
+      > pass would silently attend to the wrong context — no crash, just quietly wrong
+      > generations. Folding the prefix hash in makes the hash chain Merkle-style: block
+      > i's hash effectively commits to the entire prefix 0..i, not just block i's own
+      > tokens, so a hash match really does guarantee "identical KV cache is valid here,"
+      > not just "these particular token IDs match."
 
 ### 3.2 `can_allocate`
-- [ ] It loops `for i in range(seq.num_blocks - 1)` — not `range(seq.num_blocks)`.
+- [x] It loops `for i in range(seq.num_blocks - 1)` — not `range(seq.num_blocks)`.
       Why is the last block always excluded? What would go wrong (give a concrete
       failure) if it checked the last block too?
-- [ ] Inside the loop: `if block_id in self.used_block_ids: num_new_blocks -= 1`.
+      > **🤖 Claude — walked live in conversation, 2026-07-09:** the last block is always
+      > "open" — decode keeps appending generated tokens into it (via `may_append`) until
+      > it fills to `block_size`, only then does a new block start. Concrete failure
+      > traced: two sequences A/B share an identical partial prompt (same last block). If
+      > that block were hash-matched and shared (`ref_count=2`), both A and B independently
+      > think the next free slot in that block is theirs for their *own* next generated
+      > token — whichever decodes second silently overwrites the other's KV data at that
+      > slot. No crash, just quiet corruption: the victim's next attention pass reads a
+      > key/value that was never part of its own sequence. Only closed, immutable blocks
+      > (0..num_blocks-2) are safe to hash-match and share; the last block never is.
+- [x] Inside the loop: `if block_id in self.used_block_ids: num_new_blocks -= 1`.
       Explain the difference between a cache-hit block that's `used_block_ids` vs. one
       that's only sitting in `free_block_ids`, and why that distinction changes how many
       *new* blocks still need to be allocated.
+      # they differ because: used_block_ids is free real estate because it's already in
+      # use (another live sequence has it, ref_count>0) — reusing it costs nothing from
+      # the free pool, just ref_count += 1. free_block_ids means nobody currently owns it,
+      # but even though we skip recomputing its KV cache, claiming it still pulls one unit
+      # out of the free pool (same cost as a fresh `_allocate_block()`), so it still counts
+      # against `num_new_blocks`.
+      > **🤖 Claude:** correct, confirmed 2026-07-10.
 - [ ] Hand-trace: a seq has `num_blocks=4`. The hash chain matches at blocks 0 and 1,
       then misses at block 2. What does `can_allocate` return? What does it NOT check
       about block 3?
 
 ### 3.3 `allocate`
-- [ ] For a reused (cache-hit) block, trace both branches: one where the block is
+- [x] For a reused (cache-hit) block, trace both branches: one where the block is
       already in `used_block_ids`, one where it's only in `free_block_ids`. What happens
       to `ref_count` and the free/used sets in each case, and why do they differ?
+      # case 1 (already in used_block_ids): ref_count += 1, neither set changes (already
+      # marked in-use)
+      # case 2 (only in free_block_ids): ref_count = 1, free set loses one (block removed
+      # via free_block_ids.remove), used set gains one (block added via used_block_ids.add)
+      # they differ because case 1 is adding a second live reference to a block someone's
+      # already actively using, while case 2 is claiming a block that's currently idle —
+      # so only case 2 needs the free→used handoff
+      > **🤖 Claude:** correct, confirmed 2026-07-10.
 - [ ] What happens to `seq.num_cached_tokens` at the end of `allocate`, and how does
       that value get used later (you saw this already in Phase 4's `prepare_prefill` —
       `start = seq.num_cached_tokens`)?
