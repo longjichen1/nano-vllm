@@ -506,26 +506,76 @@ trailing partial block). Demo script (still usable, run it yourself now):
       # already actively using, while case 2 is claiming a block that's currently idle —
       # so only case 2 needs the free→used handoff
       > **🤖 Claude:** correct, confirmed 2026-07-10.
-- [ ] What happens to `seq.num_cached_tokens` at the end of `allocate`, and how does
+- [x] What happens to `seq.num_cached_tokens` at the end of `allocate`, and how does
       that value get used later (you saw this already in Phase 4's `prepare_prefill` —
       `start = seq.num_cached_tokens`)?
+      > **🤖 Claude — walked live in conversation, 2026-07-10:** `seq.num_cached_tokens =
+      > num_cached_blocks * self.block_size` — exact (not approximate) because
+      > `num_cached_blocks` only ever counts full, closed blocks (0..num_blocks-2), per
+      > 3.2's exclusion of the last block. The last block is still always allocated (via
+      > the second loop's `_allocate_block()` calls), just never counted as "cached" —
+      > allocated ≠ cached. This value later becomes `start = seq.num_cached_tokens` in
+      > `prepare_prefill`, telling the model runner to skip recomputing KV for the first
+      > N tokens and only forward-pass `token_ids[start:]` — the actual compute payoff of
+      > prefix caching, not just the memory-allocation payoff.
 
 ### 3.4 `hash_blocks` — the trickiest one
-- [ ] Why is this called from `postprocess()` (scheduler.py) rather than from
+- [x] Why is this called from `postprocess()` (scheduler.py) rather than from
       `schedule()`? What would be wrong/premature about hashing a block the moment it's
       scheduled, before the model has actually run?
-- [ ] Hand-trace: `seq.num_cached_tokens=0`, `seq.num_scheduled_tokens=300`,
+      # this is because we don't want to hash a block that hasn't been processed. schedule
+      # just adds it to the queue, but doesn't mean we actually processed it
+      > **🤖 Claude:** right instinct, sharpened during discussion — the precise mechanism
+      > is `llm_engine.step()`'s ordering (`schedule()` → `model_runner.run()` →
+      > `postprocess()`). `hash_blocks` writing `hash_to_block_id[h] = block_id` is a
+      > public promise "this block physically contains valid KV for these tokens." Doing
+      > that inside `schedule()` would make the promise before the forward pass (which
+      > actually writes the KV values into that block's GPU memory) has run — another
+      > sequence's `can_allocate` could then get pointed at uninitialized/stale memory via
+      > a "cache hit" that isn't true yet. Same class of silent corruption as 3.1/3.2, via
+      > premature timing instead of a hash collision. `postprocess()` is the first point
+      > after the real computation has landed, making the hash's promise actually true.
+- [x] Hand-trace: `seq.num_cached_tokens=0`, `seq.num_scheduled_tokens=300`,
       `block_size=256`. Compute `start` and `end`. Which block index(es) get hashed?
       Does the partially-filled second block (44 tokens) get hashed on this call? Why
       or why not — is that a bug or intentional given the floor division?
+      # start = 0, end = 1. block index 0 gets hashed, the partially filled second block
+      # does not get hashed on this call. this is because it could still change (as the
+      # block fills from decode)
+      > **🤖 Claude:** math correct (start=0, end=1, only block 0 hashed). Small
+      > refinement: not necessarily "decode" specifically — could just as easily be a
+      > later prefill chunk that fills it further. General fact: intentional, not a bug —
+      > `(start + scheduled) // block_size` generalizes the same "only hash closed blocks"
+      > invariant from 3.1/3.2/3.4's first bullet uniformly across chunked-prefill,
+      > single-shot prefill, and decode, without special-casing any of them.
 
 ### 3.5 `deallocate` / `can_append` / `may_append`
-- [ ] `deallocate`: confirm the ref-counting — when does a block actually return to
+- [x] `deallocate`: confirm the ref-counting — when does a block actually return to
       `free_block_ids`?
-- [ ] `can_append`'s return is `len(free_block_ids) >= (len(seq) % self.block_size ==
+      # when ref count goes to 0
+      > **🤖 Claude:** correct — decrements `ref_count` for every block in `block_table`,
+      > only calls `_deallocate_block()` (the one that moves it into `free_block_ids`)
+      > once `ref_count` hits 0. If another live sequence still shares it, it stays in
+      > `used_block_ids`, this sequence just drops its own reference.
+- [x] `can_append`'s return is `len(free_block_ids) >= (len(seq) % self.block_size ==
       1)`. This is in the "open questions" list below — resolve it now: at exactly what
       point in a growing decode sequence does `len(seq) % block_size == 1` become true,
       and why does that mean "we need a new block right now"?
+      > **🤖 Claude — walked live in conversation, 2026-07-10:** key timing insight: by the
+      > time `schedule()` runs for a decode step, the *previous* step's `append_token`
+      > already happened (order is `schedule()` → `run()` → `postprocess()` [appends] →
+      > next `schedule()`), so `len(seq)` already includes the most-recently-generated
+      > token — the one about to be fed as this step's model input. Traced the
+      > `num_tokens=700`/`block_size=256` example forward: block 2 fills exactly at
+      > `num_tokens=768`; the very next token pushes to `769`, and `769 % 256 == 1` is the
+      > one moment that token is the first occupant of a block (`block_table[3]`) that
+      > doesn't exist yet. `can_append`/`may_append` aren't alternatives — `can_append`
+      > gates (checked in a `while` loop; `False` triggers preemption, not `may_append`),
+      > and only once it's confirmed `True` does `may_append` actually allocate. Also
+      > cleared up a naming collision: `may_append` appends a *block* to `block_table`
+      > (in `schedule()`, before the model runs), completely separate from
+      > `seq.append_token` which appends a *token* to `token_ids` (in `postprocess()`,
+      > after the model runs) — same word, different data structure, different timing.
 
 ### 3.6 Hands-on demo — run it yourself
 - [ ] Run `/tmp/claude-0/-root-nano-vllm/be71e56e-fd78-495c-bb1a-80e16dde13f5/scratchpad/prefix_demo.py`
@@ -656,6 +706,5 @@ below.
 ## Open questions / things to come back to
 - Why does `config.py` assert `kvcache_block_size % 256 == 0` specifically (multiple of
   256, not just "positive")? Look for a triton kernel tiling constraint.
-- `can_append`'s return is `len(free_block_ids) >= (len(seq) % block_size == 1)` — the
-  boolean-as-int trick for "do we need a new block for the next appended token." Confirm
-  this is exactly the point at which a decode step crosses a block boundary.
+- ~~`can_append`'s return is `len(free_block_ids) >= (len(seq) % block_size == 1)`~~ —
+  **resolved 2026-07-10, see Phase 3.5.**
